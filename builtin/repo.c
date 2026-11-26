@@ -18,6 +18,7 @@
 #include "strbuf.h"
 #include "string-list.h"
 #include "shallow.h"
+#include "submodule.h"
 #include "tree.h"
 #include "tree-walk.h"
 #include "utf8.h"
@@ -99,6 +100,16 @@ static int get_path_commondir_relative(struct repository *repo, struct strbuf *b
 	return 0;
 }
 
+static int get_path_prefix(struct repository *repo, struct strbuf *buf)
+{
+	/*
+	 * repo->prefix is NULL when the current working directory is
+	 * the worktree root.
+	 */
+	strbuf_addstr(buf, repo->prefix ? repo->prefix : "");
+	return 0;
+}
+
 static int get_path_gitdir_absolute(struct repository *repo, struct strbuf *buf)
 {
 	const char *git_dir = repo_get_git_dir(repo);
@@ -118,6 +129,66 @@ static int get_path_gitdir_relative(struct repository *repo, struct strbuf *buf)
 		return error(_("unable to get git directory"));
 
 	format_path(buf, git_dir, repo->prefix, PATH_FORMAT_RELATIVE);
+	return 0;
+}
+
+static int get_path_index_absolute(struct repository *repo, struct strbuf *buf)
+{
+	const char *index_file = repo_get_index_file(repo);
+
+	format_path(buf, index_file, "", PATH_FORMAT_CANONICAL);
+	return 0;
+}
+
+static int get_path_index_relative(struct repository *repo, struct strbuf *buf)
+{
+	const char *index_file = repo_get_index_file(repo);
+
+	format_path(buf, index_file, repo->prefix, PATH_FORMAT_RELATIVE);
+	return 0;
+}
+
+static int get_path_superprojectworkingtree_absolute(struct repository *repo, struct strbuf *buf)
+{
+	struct strbuf superproject = STRBUF_INIT;
+
+	if (get_superproject_working_tree(repo, &superproject))
+		format_path(buf, superproject.buf, "", PATH_FORMAT_CANONICAL);
+
+	strbuf_release(&superproject);
+	return 0;
+}
+
+static int get_path_superprojectworkingtree_relative(struct repository *repo, struct strbuf *buf)
+{
+	struct strbuf superproject = STRBUF_INIT;
+
+	if (get_superproject_working_tree(repo, &superproject))
+		format_path(buf, superproject.buf, repo->prefix, PATH_FORMAT_RELATIVE);
+
+	strbuf_release(&superproject);
+	return 0;
+}
+
+static int get_path_workingtree_absolute(struct repository *repo, struct strbuf *buf)
+{
+	const char *work_tree = repo_get_work_tree(repo);
+
+	if (!work_tree)
+		return 0;
+
+	format_path(buf, work_tree, "", PATH_FORMAT_CANONICAL);
+	return 0;
+}
+
+static int get_path_workingtree_relative(struct repository *repo, struct strbuf *buf)
+{
+	const char *work_tree = repo_get_work_tree(repo);
+
+	if (!work_tree)
+		return 0;
+
+	format_path(buf, work_tree, repo->prefix, PATH_FORMAT_RELATIVE);
 	return 0;
 }
 
@@ -147,6 +218,13 @@ static const struct repo_info_field repo_info_field[] = {
 	{ "path.commondir.relative", get_path_commondir_relative },
 	{ "path.gitdir.absolute", get_path_gitdir_absolute },
 	{ "path.gitdir.relative", get_path_gitdir_relative },
+	{ "path.index.absolute", get_path_index_absolute },
+	{ "path.index.relative", get_path_index_relative },
+	{ "path.prefix", get_path_prefix },
+	{ "path.superprojectworkingtree.absolute", get_path_superprojectworkingtree_absolute },
+	{ "path.superprojectworkingtree.relative", get_path_superprojectworkingtree_relative },
+	{ "path.workingtree.absolute", get_path_workingtree_absolute },
+	{ "path.workingtree.relative", get_path_workingtree_relative },
 	{ "references.storageFormat", get_references_format },
 };
 
@@ -820,14 +898,14 @@ static void check_largest(struct object_data *data, struct object_id *oid,
 	}
 }
 
-static size_t count_tree_entries(struct object *obj)
+static size_t count_tree_entries(const struct object_id *oid,
+				 void *buffer, unsigned long size)
 {
-	struct tree *t = object_as_type(obj, OBJ_TREE, 0);
 	struct name_entry entry;
 	struct tree_desc desc;
 	size_t count = 0;
 
-	init_tree_desc(&desc, &t->object.oid, t->buffer, t->size);
+	init_tree_desc(&desc, oid, buffer, size);
 	while (tree_entry(&desc, &entry))
 		count++;
 
@@ -846,23 +924,19 @@ static int count_objects(const char *path UNUSED, struct oid_array *oids,
 		unsigned long inflated;
 		size_t inflated_st = 0;
 		struct commit *commit;
-		struct object *obj;
-		void *content;
+		void *content = NULL;
 		off_t disk;
-		int eaten;
 
 		oi.sizep = &inflated_st;
 		oi.disk_sizep = &disk;
-		oi.contentp = &content;
+		if (type == OBJ_TREE)
+			oi.contentp = &content;
 
 		if (odb_read_object_info_extended(data->odb, &oids->oid[i], &oi,
 						  OBJECT_INFO_SKIP_FETCH_OBJECT |
 						  OBJECT_INFO_QUICK) < 0)
 			continue;
 		inflated = cast_size_t_to_ulong(inflated_st);
-
-		obj = parse_object_buffer(the_repository, &oids->oid[i], type,
-					  inflated, content, &eaten);
 
 		switch (type) {
 		case OBJ_TAG:
@@ -873,7 +947,15 @@ static int count_objects(const char *path UNUSED, struct oid_array *oids,
 				      inflated);
 			break;
 		case OBJ_COMMIT:
-			commit = object_as_type(obj, OBJ_COMMIT, 0);
+			/*
+			 * Commits should already have been parsed by the
+			 * revision walk, so in theory we do not need to read
+			 * their contents again.
+			 */
+			commit = lookup_commit(data->odb->repo, &oids->oid[i]);
+			if (!commit || repo_parse_commit(data->odb->repo, commit))
+				continue;
+
 			stats->type_counts.commits++;
 			stats->inflated_sizes.commits += inflated;
 			stats->disk_sizes.commits += disk;
@@ -889,7 +971,10 @@ static int count_objects(const char *path UNUSED, struct oid_array *oids,
 			check_largest(&stats->largest.tree_size, &oids->oid[i],
 				      inflated);
 			check_largest(&stats->largest.tree_entries, &oids->oid[i],
-				      count_tree_entries(obj));
+				      count_tree_entries(&oids->oid[i], content,
+							 inflated));
+
+			free(content);
 			break;
 		case OBJ_BLOB:
 			stats->type_counts.blobs++;
@@ -901,9 +986,6 @@ static int count_objects(const char *path UNUSED, struct oid_array *oids,
 		default:
 			BUG("invalid object type");
 		}
-
-		if (!eaten)
-			free(content);
 	}
 
 	object_count = get_total_object_values(&stats->type_counts);
